@@ -1,0 +1,48 @@
+{
+  "template_id": "future_first",
+  "product_name": "FWD Future First",
+  "master_file": "master.pptx",
+  "canvas": { "scale_in_per_px": 0.015949 },
+  "font": { "family": "Calibri" },
+
+  "title_slide": {
+    "index": 0,
+    "prospect_name_box": { "x_in": 1.55, "y_in": 8.7, "w_in": 11.0, "h_in": 1.6, "size_pt": 80, "color": "002642" },
+    "prepared_by_box":   { "x_in": 1.6,  "y_in": 10.35, "w_in": 11.0, "h_in": 0.7, "size_pt": 40, "color": "002642" }
+  },
+
+  "quote_slide": {
+    "index": 1,
+    "info_boxes": {
+      "age":      { "x0": 757,  "y0": 28,  "x1": 943,  "y1": 90,  "size_pt": 25 },
+      "class":    { "x0": 757,  "y0": 96,  "x1": 943,  "y1": 140, "size_pt": 25 },
+      "birthday": { "x0": 1310, "y0": 28,  "x1": 1470, "y1": 90,  "size_pt": 25 },
+      "smoking":  { "x0": 1310, "y0": 96,  "x1": 1470, "y1": 140, "size_pt": 25 }
+    },
+    "columns": {
+      "A": [546, 900],
+      "B": [902, 1248],
+      "C": [1250, 1596]
+    },
+    "monthly_premium_row": { "y0": 213, "y1": 256, "size_pt": 25 },
+    "data_rows": [
+      { "field": "death",                    "y0": 256, "y1": 292 },
+      { "field": "tpd",                      "y0": 292, "y1": 329 },
+      { "field": "terminal_illness",         "y0": 329, "y1": 365 },
+      { "field": "ci_minus",                 "y0": 365, "y1": 401 },
+      { "field": "ci_plus",                  "y0": 401, "y1": 438 },
+      { "field": "simplified_ci",            "y0": 438, "y1": 474 },
+      { "field": "waiver_policy_owner",      "y0": 474, "y1": 511 },
+      { "field": "waiver_life_assured",      "y0": 511, "y1": 547 },
+      { "field": "medical_card",             "y0": 547, "y1": 584 },
+      { "field": "room_and_board",           "y0": 584, "y1": 621 },
+      { "field": "annual_limit",             "y0": 621, "y1": 659 },
+      { "field": "lifetime_limit",           "y0": 659, "y1": 696 },
+      { "field": "co_insurance_deductible",  "y0": 696, "y1": 734 },
+      { "field": "personal_accident",        "y0": 734, "y1": 774 },
+      { "field": "coverage_up_to_age",       "y0": 774, "y1": 810 }
+    ],
+    "data_row_size_pt": 25,
+    "remarks_row": { "y0": 813, "y1": 856, "size_pt": 25, "color": "FFFFFF" }
+  }
+}

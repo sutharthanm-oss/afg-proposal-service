@@ -13,6 +13,8 @@ import base64
 import json
 import os
 import subprocess
+import threading
+import time
 import uuid
 
 import httpx
@@ -30,6 +32,13 @@ os.makedirs(GENERATED_DIR, exist_ok=True)
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+AIRTABLE_API_KEY = os.environ.get("AIRTABLE_API_KEY", "")
+AIRTABLE_BASE_ID = "appCF1x7Gsju6Z3xy"
+AIRTABLE_TABLE_ID = "tblzJe74G8yCdxJAJ"
+FLD_TELEGRAM_ID = "fldT1xdaBEtTNpMWp"
+FLD_STATE = "fldkvpuiPZs7t1BOJ"
+FLD_AGENT_NAME = "fldf2O33NsInYm0Iy"
+FLD_SESSION_JSON = "fldrs5qD0Gb17haPC"
 
 EXTRACTION_SYSTEM_PROMPT = """You are an extraction engine for AFG's insurance proposal automation. You will be shown
 screenshots from the FWD Malaysia agent quoting app. Extract the data precisely and
@@ -270,6 +279,130 @@ def get_file(filename: str):
     return FileResponse(path)
 
 
+def _parse_session_data(raw: str) -> dict:
+    """Parses the semicolon-delimited 'key:value;key:value' session string
+    that the Make bot writes into Session Data JSON."""
+    out = {}
+    for segment in raw.split(";"):
+        if ":" not in segment:
+            continue
+        key, _, value = segment.partition(":")
+        out.setdefault(key, []).append(value)  # list, since rider_photo may repeat
+    return out
+
+
+def _telegram_send_document(chat_id: str, file_url: str):
+    with httpx.Client(timeout=30) as client:
+        r = client.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument",
+            data={"chat_id": chat_id, "document": file_url},
+        )
+        r.raise_for_status()
+
+
+def _telegram_send_message(chat_id: str, text: str):
+    with httpx.Client(timeout=30) as client:
+        r = client.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            data={"chat_id": chat_id, "text": text},
+        )
+        r.raise_for_status()
+
+
+def _airtable_headers():
+    return {"Authorization": f"Bearer {AIRTABLE_API_KEY}", "Content-Type": "application/json"}
+
+
+def _airtable_update_state(record_id: str, state: str):
+    with httpx.Client(timeout=15) as client:
+        client.patch(
+            f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE_ID}/{record_id}",
+            headers=_airtable_headers(),
+            json={"fields": {FLD_STATE: state}},
+        )
+
+
+def _process_one_record(record: dict):
+    fields = record["fields"]
+    record_id = record["id"]
+    telegram_id = fields.get(FLD_TELEGRAM_ID)
+    agent_name = fields.get(FLD_AGENT_NAME, "Agent")
+    session_raw = fields.get(FLD_SESSION_JSON, "")
+
+    # Claim the record immediately so no other poll cycle double-processes it.
+    _airtable_update_state(record_id, "GENERATING")
+
+    try:
+        parsed = _parse_session_data(session_raw)
+        profile_id = parsed.get("profile_photo", [None])[0]
+        base_id = parsed.get("base_photo", [None])[0]
+        rider_ids = parsed.get("rider_photo", [])
+
+        if not profile_id or not base_id:
+            _telegram_send_message(telegram_id, "Something went wrong — missing screenshots. Please type /start to try again.")
+            _airtable_update_state(record_id, "ERROR")
+            return
+
+        images = [_telegram_download_base64(profile_id), _telegram_download_base64(base_id)]
+        for rid in rider_ids:
+            images.append(_telegram_download_base64(rid))
+
+        extracted = _call_claude_extraction(images)
+        prospect = extracted["prospect"]
+        tier = extracted["tier"]
+        tier["tier_label"] = "A"
+
+        job_id = uuid.uuid4().hex[:10]
+        safe_name = "".join(c for c in prospect["name"] if c.isalnum() or c in " -_").strip() or "Proposal"
+        base_name = f"Proposal - {safe_name} - {job_id}"
+        pptx_path = os.path.join(GENERATED_DIR, f"{base_name}.pptx")
+
+        data = {"prospect": prospect, "agent_name": agent_name, "tiers": [tier]}
+        generate_proposal("future_first", data, pptx_path)
+
+        subprocess.run(
+            ["soffice", "--headless", "--convert-to", "pdf", "--outdir", GENERATED_DIR, pptx_path],
+            check=True, timeout=60,
+        )
+        pdf_path = pptx_path.rsplit(".", 1)[0] + ".pdf"
+
+        public_base = os.environ.get("PUBLIC_BASE_URL", "https://afg-proposal-service-production.up.railway.app")
+        _telegram_send_document(telegram_id, f"{public_base}/files/{os.path.basename(pptx_path)}")
+        _telegram_send_document(telegram_id, f"{public_base}/files/{os.path.basename(pdf_path)}")
+
+        _airtable_update_state(record_id, "DONE")
+    except Exception as e:
+        try:
+            _telegram_send_message(telegram_id, f"Something went wrong generating your proposal ({e}). Please type /start to try again.")
+        except Exception:
+            pass
+        _airtable_update_state(record_id, "ERROR")
+
+
+def _poll_loop():
+    while True:
+        try:
+            if AIRTABLE_API_KEY:
+                with httpx.Client(timeout=15) as client:
+                    r = client.get(
+                        f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE_ID}",
+                        headers=_airtable_headers(),
+                        params={"filterByFormula": f"{{{FLD_STATE}}}='READY_TO_GENERATE'"},
+                    )
+                    r.raise_for_status()
+                    for record in r.json().get("records", []):
+                        _process_one_record(record)
+        except Exception:
+            pass
+        time.sleep(4)
+
+
+@app.on_event("startup")
+def _start_poller():
+    if AIRTABLE_API_KEY:
+        threading.Thread(target=_poll_loop, daemon=True).start()
+
+
 @app.get("/health")
 def health():
-    return {"status": "ok", "templates": list_templates()}
+    return {"status": "ok", "templates": list_templates(), "poller_enabled": bool(AIRTABLE_API_KEY)}

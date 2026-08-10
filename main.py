@@ -282,14 +282,26 @@ def get_file(filename: str):
 
 def _parse_session_data(raw: str) -> dict:
     """Parses the semicolon-delimited 'key:value;key:value' session string
-    that the Make bot writes into Session Data JSON."""
-    out = {}
+    the Make bot writes into Session Data JSON. Screenshots are grouped into
+    tiers IN THE ORDER THEY WERE UPLOADED: each 'base_photo' starts a new
+    tier, and any 'rider_photo' entries before the next 'base_photo' belong
+    to that tier. This lets an agent upload any number of quotes (1-3) with
+    any number of riders each, with no counting logic needed on the Make side.
+    """
+    result = {"tiers": []}
+    current_tier = None
     for segment in raw.split(";"):
         if ":" not in segment:
             continue
         key, _, value = segment.partition(":")
-        out.setdefault(key, []).append(value)  # list, since rider_photo may repeat
-    return out
+        if key == "base_photo":
+            current_tier = {"base_photo": value, "rider_photos": []}
+            result["tiers"].append(current_tier)
+        elif key == "rider_photo" and current_tier is not None:
+            current_tier["rider_photos"].append(value)
+        else:
+            result[key] = value
+    return result
 
 
 def _telegram_send_document(chat_id: str, file_url: str):
@@ -339,30 +351,38 @@ def _process_one_record(record: dict):
 
     try:
         parsed = _parse_session_data(session_raw)
-        profile_id = parsed.get("profile_photo", [None])[0]
-        base_id = parsed.get("base_photo", [None])[0]
-        rider_ids = parsed.get("rider_photo", [])
+        profile_id = parsed.get("profile_photo")
+        tiers_raw = parsed.get("tiers", [])
 
-        if not profile_id or not base_id:
+        if not profile_id or not tiers_raw:
             _telegram_send_message(telegram_id, "Something went wrong — missing screenshots. Please type /start to try again.")
             _airtable_update_state(record_id, "ERROR")
             return
 
-        images = [_telegram_download_base64(profile_id), _telegram_download_base64(base_id)]
-        for rid in rider_ids:
-            images.append(_telegram_download_base64(rid))
+        profile_image = _telegram_download_base64(profile_id)
+        tier_labels = ["A", "B", "C"]
+        tiers_data = []
+        prospect = None
 
-        extracted = _call_claude_extraction(images)
-        prospect = extracted["prospect"]
-        tier = extracted["tier"]
-        tier["tier_label"] = "A"
+        for i, tier_info in enumerate(tiers_raw[:3]):  # template supports up to 3 columns
+            base_image = _telegram_download_base64(tier_info["base_photo"])
+            images = [profile_image, base_image]
+            for rid in tier_info["rider_photos"]:
+                images.append(_telegram_download_base64(rid))
+
+            extracted = _call_claude_extraction(images)
+            if prospect is None:
+                prospect = extracted["prospect"]
+            tier = extracted["tier"]
+            tier["tier_label"] = tier_labels[i]
+            tiers_data.append(tier)
 
         job_id = uuid.uuid4().hex[:10]
         safe_name = "".join(c for c in prospect["name"] if c.isalnum() or c in " -_").strip() or "Proposal"
         base_name = f"Proposal - {safe_name} - {job_id}"
         pptx_path = os.path.join(GENERATED_DIR, f"{base_name}.pptx")
 
-        data = {"prospect": prospect, "agent_name": agent_name, "tiers": [tier]}
+        data = {"prospect": prospect, "agent_name": agent_name, "tiers": tiers_data}
         generate_proposal("future_first", data, pptx_path)
 
         subprocess.run(

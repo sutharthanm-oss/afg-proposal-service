@@ -316,11 +316,15 @@ def _airtable_headers():
 
 def _airtable_update_state(record_id: str, state: str):
     with httpx.Client(timeout=15) as client:
-        client.patch(
+        r = client.patch(
             f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE_ID}/{record_id}",
             headers=_airtable_headers(),
-            json={"fields": {FLD_STATE: state}},
+            json={"fields": {FLD_STATE: state}, "typecast": True},
         )
+        if r.status_code >= 400:
+            print(f"[airtable] update FAILED for {record_id} -> {state}: {r.status_code} {r.text}", flush=True)
+        else:
+            print(f"[airtable] update OK for {record_id} -> {state}", flush=True)
 
 
 def _process_one_record(record: dict):

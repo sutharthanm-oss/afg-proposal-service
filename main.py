@@ -35,10 +35,11 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 AIRTABLE_API_KEY = os.environ.get("AIRTABLE_API_KEY", "")
 AIRTABLE_BASE_ID = "appCF1x7Gsju6Z3xy"
 AIRTABLE_TABLE_ID = "tblzJe74G8yCdxJAJ"
-FLD_TELEGRAM_ID = "fldT1xdaBEtTNpMWp"
-FLD_STATE = "fldkvpuiPZs7t1BOJ"
-FLD_AGENT_NAME = "fldf2O33NsInYm0Iy"
-FLD_SESSION_JSON = "fldrs5qD0Gb17haPC"
+# Airtable's REST API (default) keys/filters records by FIELD NAME, not field ID.
+FLD_TELEGRAM_ID = "Telegram ID"
+FLD_STATE = "State"
+FLD_AGENT_NAME = "Agent Name"
+FLD_SESSION_JSON = "Session Data JSON"
 
 EXTRACTION_SYSTEM_PROMPT = """You are an extraction engine for AFG's insurance proposal automation. You will be shown
 screenshots from the FWD Malaysia agent quoting app. Extract the data precisely and
@@ -367,20 +368,24 @@ def _process_one_record(record: dict):
         pdf_path = pptx_path.rsplit(".", 1)[0] + ".pdf"
 
         public_base = os.environ.get("PUBLIC_BASE_URL", "https://afg-proposal-service-production.up.railway.app")
-        _telegram_send_document(telegram_id, f"{public_base}/files/{os.path.basename(pptx_path)}")
+        # PDF only for now — PPTX delivery deferred to a later phase to keep this simpler.
         _telegram_send_document(telegram_id, f"{public_base}/files/{os.path.basename(pdf_path)}")
 
         _airtable_update_state(record_id, "DONE")
     except Exception as e:
+        print(f"[process] error for record {record_id}: {e}", flush=True)
         try:
-            _telegram_send_message(telegram_id, f"Something went wrong generating your proposal ({e}). Please type /start to try again.")
+            _telegram_send_message(telegram_id, f"Something went wrong generating your proposal. Please type /start to try again.")
         except Exception:
             pass
         _airtable_update_state(record_id, "ERROR")
 
 
 def _poll_loop():
+    print("[poller] background thread started", flush=True)
+    cycle = 0
     while True:
+        cycle += 1
         try:
             if AIRTABLE_API_KEY:
                 with httpx.Client(timeout=15) as client:
@@ -390,10 +395,14 @@ def _poll_loop():
                         params={"filterByFormula": f"{{{FLD_STATE}}}='READY_TO_GENERATE'"},
                     )
                     r.raise_for_status()
-                    for record in r.json().get("records", []):
+                    records = r.json().get("records", [])
+                    if cycle % 15 == 1:
+                        print(f"[poller] cycle {cycle}: {len(records)} record(s) matched", flush=True)
+                    for record in records:
+                        print(f"[poller] processing record {record['id']}", flush=True)
                         _process_one_record(record)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[poller] error: {e}", flush=True)
         time.sleep(4)
 
 

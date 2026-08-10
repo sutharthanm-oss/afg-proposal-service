@@ -16,6 +16,7 @@ import subprocess
 import threading
 import time
 from datetime import datetime
+from urllib.parse import quote
 
 import httpx
 from fastapi import FastAPI, HTTPException
@@ -286,7 +287,16 @@ def get_file(filename: str):
     path = os.path.join(GENERATED_DIR, filename)
     if not os.path.isfile(path):
         raise HTTPException(404, "File not found")
-    return FileResponse(path)
+    # FastAPI/Starlette can't always guess the right MIME type for .pptx on
+    # every host, and Telegram's URL-fetcher rejects documents with a wrong
+    # or missing Content-Type -- set it explicitly for the types we serve.
+    media_types = {
+        ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        ".pdf": "application/pdf",
+    }
+    ext = os.path.splitext(filename)[1].lower()
+    media_type = media_types.get(ext)
+    return FileResponse(path, media_type=media_type, filename=filename)
 
 
 def _parse_session_data(raw: str) -> dict:
@@ -404,12 +414,12 @@ def _process_one_record(record: dict):
         # Send PDF first (proven reliable) and PPTX best-effort — if one delivery
         # fails, it must not block the other from reaching the agent.
         try:
-            _telegram_send_document(telegram_id, f"{public_base}/files/{os.path.basename(pdf_path)}")
+            _telegram_send_document(telegram_id, f"{public_base}/files/{quote(os.path.basename(pdf_path))}")
         except Exception as e:
             print(f"[process] PDF delivery failed for {record_id}: {e}", flush=True)
 
         try:
-            _telegram_send_document(telegram_id, f"{public_base}/files/{os.path.basename(pptx_path)}")
+            _telegram_send_document(telegram_id, f"{public_base}/files/{quote(os.path.basename(pptx_path))}")
         except Exception as e:
             print(f"[process] PPTX delivery failed for {record_id}: {e}", flush=True)
 

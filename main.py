@@ -1,14 +1,21 @@
 """
 AFG Proposal Generation Service
 POST /generate -> runs overlay_engine, converts to PDF via LibreOffice, returns both files.
+POST /generate-from-telegram -> downloads screenshots from Telegram, extracts data via
+    Claude, then generates the proposal. This is the endpoint Make.com actually calls --
+    it does all the heavy lifting (image download, vision API, JSON parsing) that Make's
+    module set isn't well suited for, so Make just sends file_ids and gets back file URLs.
 
 Deploy: Railway (Dockerfile below handles LibreOffice install).
-Called by: Make.com, after the Claude API extraction step.
+Env vars required: ANTHROPIC_API_KEY, TELEGRAM_BOT_TOKEN
 """
+import base64
+import json
 import os
 import subprocess
 import uuid
 
+import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -20,6 +27,54 @@ app = FastAPI(title="AFG Proposal Generation Service")
 
 GENERATED_DIR = os.path.join(os.path.dirname(__file__), "generated")
 os.makedirs(GENERATED_DIR, exist_ok=True)
+
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+
+EXTRACTION_SYSTEM_PROMPT = """You are an extraction engine for AFG's insurance proposal automation. You will be shown
+screenshots from the FWD Malaysia agent quoting app. Extract the data precisely and
+return ONLY valid JSON matching the schema below -- no preamble, no markdown fences,
+no commentary.
+
+INPUT TYPES YOU MAY RECEIVE:
+1. A "Who will be covered" profile screen -- shows name, DOB, age, gender, smoking
+   habit, religion, nationality, occupation, mobile number, and which product(s)
+   are covered.
+2. A "Benefit illustration details" screen, "Base plan" tab -- shows the base
+   product name, sum covered, and total/basic/initial contribution figures.
+3. A "Benefit illustration details" screen, "Additional protection" tab -- shows
+   one or more riders, each with its own sum covered and modal contribution.
+
+RULES:
+- If a field is not visible in any screenshot provided, output "-" for that field.
+  Never guess or infer a number that isn't shown.
+- "Class" is never shown in this app flow. Always output "-" for class.
+- Monthly Premium = the base plan's "Total Contribution" figure, exactly as shown.
+  Do NOT add rider contributions on top -- "Total Contribution" already includes
+  every rider attached to that quote.
+- Coverage up to age = person's current age + contribution/certificate term.
+- Map product sum covered into these benefit rows by matching the product name:
+  - "FWD Future First" (base) -> death, tpd, terminal_illness (same sum covered
+    value for all three)
+  - "FWD Critical Illness Rider" or "FWD CI First" (full/regular version) -> ci_plus
+  - "FWD Critical Illness Lite Rider" (reduced condition list) -> ci_minus
+  - "FWD Critical Illness Waiver of Contribution Rider" -> waiver_life_assured,
+    value "Included" (NOT its sum covered figure)
+  - Any product/rider you don't recognize -> put its name and sum covered in
+    "unmapped_items" rather than forcing it into a row.
+
+OUTPUT SCHEMA (return exactly this shape, as a single tier labeled "A"):
+{
+  "prospect": {"name": string, "dob": string, "age": string, "smoking_status": string},
+  "tier": {
+    "monthly_premium": string, "death": string, "tpd": string, "terminal_illness": string,
+    "ci_minus": string, "ci_plus": string, "simplified_ci": string,
+    "waiver_policy_owner": string, "waiver_life_assured": string, "medical_card": string,
+    "room_and_board": string, "annual_limit": string, "lifetime_limit": string,
+    "co_insurance_deductible": string, "personal_accident": string,
+    "coverage_up_to_age": string, "remarks": string
+  }
+}"""
 
 
 class Prospect(BaseModel):
@@ -71,7 +126,7 @@ def generate(req: GenerateRequest):
 
     job_id = uuid.uuid4().hex[:10]
     safe_name = "".join(c for c in req.prospect.name if c.isalnum() or c in " -_").strip() or "Proposal"
-    base_name = f"{safe_name} - {job_id}"
+    base_name = f"Proposal - {safe_name} - {job_id}"
     pptx_path = os.path.join(GENERATED_DIR, f"{base_name}.pptx")
 
     data = req.dict()
@@ -86,6 +141,122 @@ def generate(req: GenerateRequest):
 
     return {
         "job_id": job_id,
+        "pptx_url": f"/files/{os.path.basename(pptx_path)}",
+        "pdf_url": f"/files/{os.path.basename(pdf_path)}",
+    }
+
+
+class TelegramGenerateRequest(BaseModel):
+    template_id: str
+    agent_name: str
+    profile_file_id: str
+    base_file_id: str
+    rider_file_ids: List[str] = []
+
+
+def _telegram_download_base64(file_id: str) -> tuple[str, str]:
+    """Returns (base64_data, media_type) for a Telegram file_id."""
+    if not TELEGRAM_BOT_TOKEN:
+        raise HTTPException(500, "TELEGRAM_BOT_TOKEN not configured on server")
+
+    with httpx.Client(timeout=30) as client:
+        r = client.get(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile",
+            params={"file_id": file_id},
+        )
+        r.raise_for_status()
+        result = r.json().get("result", {})
+        file_path = result.get("file_path")
+        if not file_path:
+            raise HTTPException(502, f"Telegram getFile failed for {file_id}: {r.text}")
+
+        img = client.get(
+            f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
+        )
+        img.raise_for_status()
+
+    media_type = "image/png" if file_path.lower().endswith(".png") else "image/jpeg"
+    return base64.b64encode(img.content).decode("utf-8"), media_type
+
+
+def _call_claude_extraction(images_b64: List[tuple[str, str]]) -> dict:
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(500, "ANTHROPIC_API_KEY not configured on server")
+
+    content = []
+    for b64, media_type in images_b64:
+        content.append({
+            "type": "image",
+            "source": {"type": "base64", "media_type": media_type, "data": b64},
+        })
+    content.append({"type": "text", "text": "Extract the data from these screenshots per your instructions."})
+
+    with httpx.Client(timeout=60) as client:
+        r = client.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 2000,
+                "system": EXTRACTION_SYSTEM_PROMPT,
+                "messages": [{"role": "user", "content": content}],
+            },
+        )
+        r.raise_for_status()
+        data = r.json()
+
+    text = "".join(block.get("text", "") for block in data.get("content", []) if block.get("type") == "text")
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.split("```")[1]
+        if text.startswith("json"):
+            text = text[4:]
+    try:
+        return json.loads(text.strip())
+    except json.JSONDecodeError as e:
+        raise HTTPException(502, f"Claude returned unparseable JSON: {e}. Raw: {text[:500]}")
+
+
+@app.post("/generate-from-telegram")
+def generate_from_telegram(req: TelegramGenerateRequest):
+    if req.template_id not in list_templates():
+        raise HTTPException(400, f"Unknown template_id '{req.template_id}'. "
+                                  f"Available: {list_templates()}")
+
+    # Download all screenshots from Telegram
+    images = [_telegram_download_base64(req.profile_file_id)]
+    images.append(_telegram_download_base64(req.base_file_id))
+    for rid in req.rider_file_ids:
+        images.append(_telegram_download_base64(rid))
+
+    # Extract structured data via Claude
+    extracted = _call_claude_extraction(images)
+    prospect = extracted["prospect"]
+    tier = extracted["tier"]
+    tier["tier_label"] = "A"
+
+    # Generate the proposal using the same engine as /generate
+    job_id = uuid.uuid4().hex[:10]
+    safe_name = "".join(c for c in prospect["name"] if c.isalnum() or c in " -_").strip() or "Proposal"
+    base_name = f"Proposal - {safe_name} - {job_id}"
+    pptx_path = os.path.join(GENERATED_DIR, f"{base_name}.pptx")
+
+    data = {"prospect": prospect, "agent_name": req.agent_name, "tiers": [tier]}
+    generate_proposal(req.template_id, data, pptx_path)
+
+    subprocess.run(
+        ["soffice", "--headless", "--convert-to", "pdf", "--outdir", GENERATED_DIR, pptx_path],
+        check=True, timeout=60,
+    )
+    pdf_path = pptx_path.rsplit(".", 1)[0] + ".pdf"
+
+    return {
+        "job_id": job_id,
+        "extracted": extracted,
         "pptx_url": f"/files/{os.path.basename(pptx_path)}",
         "pdf_url": f"/files/{os.path.basename(pdf_path)}",
     }

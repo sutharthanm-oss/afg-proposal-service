@@ -42,6 +42,14 @@ FLD_STATE = "State"
 FLD_AGENT_NAME = "Agent Name"
 FLD_SESSION_JSON = "Session Data JSON"
 
+# Permanent agent roster (separate base) -- registered once at onboarding by Make,
+# updated here on every completed proposal to track usage.
+AGENTS_BASE_ID = "appoXG0DH4k5onBmd"
+AGENTS_TABLE_ID = "tbl4pcT77XPif1RpV"
+AGENTS_FLD_TELEGRAM_ID = "Telegram ID"
+AGENTS_FLD_TOTAL_PROPOSALS = "Total Proposals Generated"
+AGENTS_FLD_LAST_ACTIVE = "Last Active"
+
 EXTRACTION_SYSTEM_PROMPT = """You are an extraction engine for AFG's insurance proposal automation. You will be shown
 screenshots from the FWD Malaysia agent quoting app. Extract the data precisely and
 return ONLY valid JSON matching the schema below -- no preamble, no markdown fences,
@@ -375,6 +383,37 @@ def _airtable_update_state(record_id: str, state: str):
             print(f"[airtable] update OK for {record_id} -> {state}", flush=True)
 
 
+def _track_agent_usage(telegram_id: str):
+    """Increments Total Proposals Generated and stamps Last Active on the
+    agent's permanent roster record. Best-effort -- a failure here must never
+    block delivery of an already-generated proposal."""
+    try:
+        with httpx.Client(timeout=15) as client:
+            r = client.get(
+                f"https://api.airtable.com/v0/{AGENTS_BASE_ID}/{AGENTS_TABLE_ID}",
+                headers=_airtable_headers(),
+                params={"filterByFormula": f"{{{AGENTS_FLD_TELEGRAM_ID}}}='{telegram_id}'", "maxRecords": 1},
+            )
+            r.raise_for_status()
+            records = r.json().get("records", [])
+            if not records:
+                print(f"[usage] no Agents record found for {telegram_id}, skipping", flush=True)
+                return
+            agent_record = records[0]
+            current_total = agent_record["fields"].get(AGENTS_FLD_TOTAL_PROPOSALS, 0) or 0
+            client.patch(
+                f"https://api.airtable.com/v0/{AGENTS_BASE_ID}/{AGENTS_TABLE_ID}/{agent_record['id']}",
+                headers=_airtable_headers(),
+                json={"fields": {
+                    AGENTS_FLD_TOTAL_PROPOSALS: current_total + 1,
+                    AGENTS_FLD_LAST_ACTIVE: datetime.utcnow().isoformat(),
+                }, "typecast": True},
+            )
+            print(f"[usage] {telegram_id} -> {current_total + 1} total proposals", flush=True)
+    except Exception as e:
+        print(f"[usage] tracking failed for {telegram_id}: {e}", flush=True)
+
+
 def _process_one_record(record: dict):
     fields = record["fields"]
     record_id = record["id"]
@@ -438,6 +477,7 @@ def _process_one_record(record: dict):
         except Exception as e:
             print(f"[process] PPTX delivery failed for {record_id}: {e}", flush=True)
 
+        _track_agent_usage(telegram_id)
         _airtable_update_state(record_id, "DONE")
     except Exception as e:
         print(f"[process] error for record {record_id}: {e}", flush=True)

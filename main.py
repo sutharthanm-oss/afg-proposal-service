@@ -392,7 +392,8 @@ def _process_one_record(record: dict):
         pdf_path = pptx_path.rsplit(".", 1)[0] + ".pdf"
 
         public_base = os.environ.get("PUBLIC_BASE_URL", "https://afg-proposal-service-production.up.railway.app")
-        # PDF only for now — PPTX delivery deferred to a later phase to keep this simpler.
+        # Deliver both formats — PPTX (editable, for the agent's own tweaks) and PDF (client-ready).
+        _telegram_send_document(telegram_id, f"{public_base}/files/{os.path.basename(pptx_path)}")
         _telegram_send_document(telegram_id, f"{public_base}/files/{os.path.basename(pdf_path)}")
 
         _airtable_update_state(record_id, "DONE")

@@ -323,14 +323,29 @@ def _parse_session_data(raw: str) -> dict:
     return result
 
 
-def _telegram_send_document(chat_id: str, file_url: str):
-    with httpx.Client(timeout=30) as client:
-        r = client.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument",
-            data={"chat_id": chat_id, "document": file_url},
-        )
+def _telegram_send_document_by_path(chat_id: str, file_path: str):
+    """Uploads the file directly (multipart), rather than giving Telegram a
+    URL to fetch -- Telegram's URL-fetch path is picky about Content-Type
+    for less-common formats (e.g. .pptx) and can reject valid files with
+    'wrong type of the web page content'. Direct upload sidesteps that
+    entirely and is the standard, most reliable way to send documents."""
+    filename = os.path.basename(file_path)
+    mime_map = {
+        ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        ".pdf": "application/pdf",
+    }
+    ext = os.path.splitext(filename)[1].lower()
+    mime_type = mime_map.get(ext, "application/octet-stream")
+
+    with httpx.Client(timeout=60) as client:
+        with open(file_path, "rb") as f:
+            r = client.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument",
+                data={"chat_id": chat_id},
+                files={"document": (filename, f, mime_type)},
+            )
         if r.status_code >= 400:
-            print(f"[telegram] sendDocument FAILED for {file_url}: {r.status_code} {r.text}", flush=True)
+            print(f"[telegram] sendDocument FAILED for {filename}: {r.status_code} {r.text}", flush=True)
         r.raise_for_status()
 
 
@@ -411,15 +426,15 @@ def _process_one_record(record: dict):
         pdf_path = pptx_path.rsplit(".", 1)[0] + ".pdf"
 
         public_base = os.environ.get("PUBLIC_BASE_URL", "https://afg-proposal-service-production.up.railway.app")
-        # Send PDF first (proven reliable) and PPTX best-effort — if one delivery
-        # fails, it must not block the other from reaching the agent.
+        # Upload both files directly (multipart) rather than by URL -- more
+        # reliable, and PDF going first means a PPTX hiccup can't block it.
         try:
-            _telegram_send_document(telegram_id, f"{public_base}/files/{quote(os.path.basename(pdf_path))}")
+            _telegram_send_document_by_path(telegram_id, pdf_path)
         except Exception as e:
             print(f"[process] PDF delivery failed for {record_id}: {e}", flush=True)
 
         try:
-            _telegram_send_document(telegram_id, f"{public_base}/files/{quote(os.path.basename(pptx_path))}")
+            _telegram_send_document_by_path(telegram_id, pptx_path)
         except Exception as e:
             print(f"[process] PPTX delivery failed for {record_id}: {e}", flush=True)
 

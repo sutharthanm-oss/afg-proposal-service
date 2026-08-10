@@ -15,7 +15,7 @@ import os
 import subprocess
 import threading
 import time
-import uuid
+from datetime import datetime
 
 import httpx
 from fastapi import FastAPI, HTTPException
@@ -87,6 +87,19 @@ OUTPUT SCHEMA (return exactly this shape, as a single tier labeled "A"):
 }"""
 
 
+def _build_filename(name: str) -> str:
+    """Proposal - Name - DDMMYY v1.0 (v2.0, v3.0... if the same person already
+    has a proposal generated today)."""
+    safe_name = "".join(c for c in name if c.isalnum() or c in " -_").strip() or "Proposal"
+    date_str = datetime.now().strftime("%d%m%y")
+    version = 1
+    while True:
+        candidate = f"Proposal - {safe_name} - {date_str} v{version}.0"
+        if not os.path.exists(os.path.join(GENERATED_DIR, f"{candidate}.pptx")):
+            return candidate
+        version += 1
+
+
 class Prospect(BaseModel):
     name: str
     dob: str = "-"
@@ -134,9 +147,7 @@ def generate(req: GenerateRequest):
         raise HTTPException(400, f"Unknown template_id '{req.template_id}'. "
                                   f"Available: {list_templates()}")
 
-    job_id = uuid.uuid4().hex[:10]
-    safe_name = "".join(c for c in req.prospect.name if c.isalnum() or c in " -_").strip() or "Proposal"
-    base_name = f"Proposal - {safe_name} - {job_id}"
+    base_name = _build_filename(req.prospect.name)
     pptx_path = os.path.join(GENERATED_DIR, f"{base_name}.pptx")
 
     data = req.dict()
@@ -150,7 +161,7 @@ def generate(req: GenerateRequest):
     pdf_path = pptx_path.rsplit(".", 1)[0] + ".pdf"
 
     return {
-        "job_id": job_id,
+        "filename": base_name,
         "pptx_url": f"/files/{os.path.basename(pptx_path)}",
         "pdf_url": f"/files/{os.path.basename(pdf_path)}",
     }
@@ -250,9 +261,7 @@ def generate_from_telegram(req: TelegramGenerateRequest):
     tier["tier_label"] = "A"
 
     # Generate the proposal using the same engine as /generate
-    job_id = uuid.uuid4().hex[:10]
-    safe_name = "".join(c for c in prospect["name"] if c.isalnum() or c in " -_").strip() or "Proposal"
-    base_name = f"Proposal - {safe_name} - {job_id}"
+    base_name = _build_filename(prospect["name"])
     pptx_path = os.path.join(GENERATED_DIR, f"{base_name}.pptx")
 
     data = {"prospect": prospect, "agent_name": req.agent_name, "tiers": [tier]}
@@ -265,7 +274,7 @@ def generate_from_telegram(req: TelegramGenerateRequest):
     pdf_path = pptx_path.rsplit(".", 1)[0] + ".pdf"
 
     return {
-        "job_id": job_id,
+        "filename": base_name,
         "extracted": extracted,
         "pptx_url": f"/files/{os.path.basename(pptx_path)}",
         "pdf_url": f"/files/{os.path.basename(pdf_path)}",
@@ -310,6 +319,8 @@ def _telegram_send_document(chat_id: str, file_url: str):
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument",
             data={"chat_id": chat_id, "document": file_url},
         )
+        if r.status_code >= 400:
+            print(f"[telegram] sendDocument FAILED for {file_url}: {r.status_code} {r.text}", flush=True)
         r.raise_for_status()
 
 
@@ -377,9 +388,7 @@ def _process_one_record(record: dict):
             tier["tier_label"] = tier_labels[i]
             tiers_data.append(tier)
 
-        job_id = uuid.uuid4().hex[:10]
-        safe_name = "".join(c for c in prospect["name"] if c.isalnum() or c in " -_").strip() or "Proposal"
-        base_name = f"Proposal - {safe_name} - {job_id}"
+        base_name = _build_filename(prospect["name"])
         pptx_path = os.path.join(GENERATED_DIR, f"{base_name}.pptx")
 
         data = {"prospect": prospect, "agent_name": agent_name, "tiers": tiers_data}
@@ -392,9 +401,17 @@ def _process_one_record(record: dict):
         pdf_path = pptx_path.rsplit(".", 1)[0] + ".pdf"
 
         public_base = os.environ.get("PUBLIC_BASE_URL", "https://afg-proposal-service-production.up.railway.app")
-        # Deliver both formats — PPTX (editable, for the agent's own tweaks) and PDF (client-ready).
-        _telegram_send_document(telegram_id, f"{public_base}/files/{os.path.basename(pptx_path)}")
-        _telegram_send_document(telegram_id, f"{public_base}/files/{os.path.basename(pdf_path)}")
+        # Send PDF first (proven reliable) and PPTX best-effort — if one delivery
+        # fails, it must not block the other from reaching the agent.
+        try:
+            _telegram_send_document(telegram_id, f"{public_base}/files/{os.path.basename(pdf_path)}")
+        except Exception as e:
+            print(f"[process] PDF delivery failed for {record_id}: {e}", flush=True)
+
+        try:
+            _telegram_send_document(telegram_id, f"{public_base}/files/{os.path.basename(pptx_path)}")
+        except Exception as e:
+            print(f"[process] PPTX delivery failed for {record_id}: {e}", flush=True)
 
         _airtable_update_state(record_id, "DONE")
     except Exception as e:

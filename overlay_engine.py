@@ -50,6 +50,12 @@ def _add_fixed_textbox(slide, x_in, y_in, w_in, h_in, text, size_pt, color_hex,
     return tb
 
 
+def _estimate_text_width_in(text, size_pt, avg_char_width_factor=0.56):
+    """Rough width estimate for bold Calibri -- good enough to decide wrapping
+    and reposition the line below, without needing a real font-metrics lib."""
+    return len(text) * size_pt * avg_char_width_factor / 72.0
+
+
 def generate_proposal(template_id: str, data: dict, output_path: str) -> str:
     """
     data must match the extraction-prompt.md schema:
@@ -76,12 +82,27 @@ def generate_proposal(template_id: str, data: dict, output_path: str) -> str:
     slide1 = prs.slides[ts["index"]]
 
     nb = ts["prospect_name_box"]
+    name_text = prospect["name"]
+    name_size = nb["size_pt"]
+
+    # Shrink long names instead of letting them wrap into "Prepared By" below.
+    # Floor of 40pt keeps it legible; box width minus ~0.3in for internal margins.
+    usable_w = nb["w_in"] - 0.3
+    min_size = 40
+    while name_size > min_size and _estimate_text_width_in(name_text, name_size) > usable_w:
+        name_size -= 2
+
     _add_fixed_textbox(slide1, nb["x_in"], nb["y_in"], nb["w_in"], nb["h_in"],
-                        prospect["name"], nb["size_pt"], nb["color"],
-                        font_family=font_family)
+                        name_text, name_size, nb["color"],
+                        font_family=font_family, word_wrap=False)
+
+    # Position "Prepared By" relative to the actual rendered name size, so it
+    # never collides even if the name still needed to shrink.
+    name_line_height_in = (name_size * 1.25) / 72.0
+    prepared_by_y = nb["y_in"] + name_line_height_in + 0.35
 
     pb = ts["prepared_by_box"]
-    _add_fixed_textbox(slide1, pb["x_in"], pb["y_in"], pb["w_in"], pb["h_in"],
+    _add_fixed_textbox(slide1, pb["x_in"], prepared_by_y, pb["w_in"], pb["h_in"],
                         f"Prepared By: {agent_name}", pb["size_pt"], pb["color"],
                         font_family=font_family)
 

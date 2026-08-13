@@ -81,13 +81,18 @@ RULES:
     value "Included" (NOT its sum covered figure)
   - "FWD Medical Rider" -> this rider has no single sum-covered figure; instead
     populate FIVE separate fields:
-    medical_card = "Included", room_and_board = its Room & Board figure (as
-    shown on screen), annual_limit = its Overall Annual Limit figure (as shown
-    on screen), co_insurance_deductible = its Deductible figure (as shown on
-    screen), lifetime_limit = "Unlimited". Also, whenever this rider is present,
-    append this exact sentence to remarks (add it after any existing remarks
-    text, don't replace them): "Medical Card rider premium will increase every
-    5 years (following your age band)."
+    medical_card = "Included", room_and_board = its "Hospital Room & Board"
+    figure (as shown on screen), annual_limit = its "Initial Overall Annual
+    Limit" figure (as shown on screen -- this exact label may appear as
+    "Annual Limit" in the app; read whatever figure is shown next to it,
+    typically 200,000 / 300,000 / 500,000 / 2,000,000 depending on plan tier,
+    but always take the actual on-screen value, never assume from a plan
+    number alone), co_insurance_deductible = its "Deductible" figure (as shown
+    on screen), lifetime_limit = "Unlimited" (this rider has no lifetime cap).
+    Also, whenever this rider is present, append this exact sentence to
+    remarks (add it after any existing remarks text, don't replace them):
+    "Medical Card rider premium will increase every 5 years (following your
+    age band)."
   - Any product/rider you don't recognize -> put its name and sum covered in
     "unmapped_items" rather than forcing it into a row.
 

@@ -43,6 +43,6 @@
       { "field": "coverage_up_to_age",       "y0": 774, "y1": 810 }
     ],
     "data_row_size_pt": 25,
-    "remarks_row": { "y0": 813, "y1": 856, "size_pt": 25, "color": "FFFFFF" }
+    "remarks_row": { "y0": 813, "y1": 856, "size_pt": 19, "color": "FFFFFF" }
   }
 }

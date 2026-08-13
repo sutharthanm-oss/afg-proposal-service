@@ -79,6 +79,15 @@ RULES:
   - "FWD Critical Illness Lite Rider" (reduced condition list) -> ci_minus
   - "FWD Critical Illness Waiver of Contribution Rider" -> waiver_life_assured,
     value "Included" (NOT its sum covered figure)
+  - "FWD Medical Rider" -> this rider has no single sum-covered figure; instead
+    populate FIVE separate fields:
+    medical_card = "Included", room_and_board = its Room & Board figure (as
+    shown on screen), annual_limit = its Overall Annual Limit figure (as shown
+    on screen), co_insurance_deductible = its Deductible figure (as shown on
+    screen), lifetime_limit = "Unlimited". Also, whenever this rider is present,
+    append this exact sentence to remarks (add it after any existing remarks
+    text, don't replace them): "Medical Card rider premium will increase every
+    5 years (following your age band)."
   - Any product/rider you don't recognize -> put its name and sum covered in
     "unmapped_items" rather than forcing it into a row.
 

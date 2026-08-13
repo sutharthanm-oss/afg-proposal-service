@@ -83,16 +83,19 @@ RULES:
     populate FIVE separate fields:
     medical_card = "Included", room_and_board = its "Hospital Room & Board"
     figure (as shown on screen), annual_limit = its "Initial Overall Annual
-    Limit" figure (as shown on screen -- this exact label may appear as
-    "Annual Limit" in the app; read whatever figure is shown next to it,
-    typically 200,000 / 300,000 / 500,000 / 2,000,000 depending on plan tier,
-    but always take the actual on-screen value, never assume from a plan
-    number alone), co_insurance_deductible = its "Deductible" figure (as shown
-    on screen), lifetime_limit = "Unlimited" (this rider has no lifetime cap).
-    Also, whenever this rider is present, append this exact sentence to
+    Limit" figure -- this is a REQUIRED field for this rider, look carefully
+    across the whole screenshot for it (it may be labeled "Annual Limit",
+    "Initial Overall Annual Limit", or "Overall Annual Limit"; typical values
+    are 200,000 / 300,000 / 500,000 / 2,000,000 depending on plan tier, but
+    always take the actual on-screen value, never assume from a plan number
+    alone, and never leave this as "-" if the rider is present -- if truly not
+    visible on any provided screenshot, use the plan-tier table to infer it
+    from the Room & Board figure: 200->200,000, 300->300,000, 500->500,000,
+    2,000->2,000,000), co_insurance_deductible = its "Deductible" figure (as
+    shown on screen), lifetime_limit = "Unlimited" (this rider has no lifetime
+    cap). Also, whenever this rider is present, append this exact sentence to
     remarks (add it after any existing remarks text, don't replace them):
-    "Medical Card rider premium will increase every 5 years (following your
-    age band)."
+    "Medical Card Rider premium will increase every 5 years."
   - Any product/rider you don't recognize -> put its name and sum covered in
     "unmapped_items" rather than forcing it into a row.
 

@@ -67,6 +67,12 @@ INPUT TYPES YOU MAY RECEIVE:
 RULES:
 - If a field is not visible in any screenshot provided, output "-" for that field.
   Never guess or infer a number that isn't shown.
+- For the "Who will be covered" screen specifically: name, date of birth, age,
+  and smoking status are ALWAYS shown together under "Personal information" --
+  actively look for all four there before defaulting any of them to "-". Date
+  of birth commonly appears as "DD/MM/YYYY (NN y.o.)" -- extract the date into
+  dob and the age number into age separately, don't leave age blank just
+  because it's embedded in the same line as the date.
 - "Class" is never shown in this app flow. Always output "-" for class.
 - Monthly Premium = the base plan's "Total Contribution" figure, exactly as shown.
   Do NOT add rider contributions on top -- "Total Contribution" already includes
@@ -263,7 +269,9 @@ def _call_claude_extraction(images_b64: List[tuple[str, str]]) -> dict:
         if text.startswith("json"):
             text = text[4:]
     try:
-        return json.loads(text.strip())
+        parsed = json.loads(text.strip())
+        print(f"[extraction] result: {json.dumps(parsed)}", flush=True)
+        return parsed
     except json.JSONDecodeError as e:
         raise HTTPException(502, f"Claude returned unparseable JSON: {e}. Raw: {text[:500]}")
 
@@ -496,6 +504,25 @@ def _process_one_record(record: dict):
 
         _track_agent_usage(telegram_id)
         _airtable_update_state(record_id, "DONE")
+
+        # Auto-reset for the next proposal -- agent stays registered (name/code
+        # untouched), only the in-progress proposal data clears, so they can go
+        # straight into another proposal without needing to type /start.
+        try:
+            with httpx.Client(timeout=15) as client:
+                client.patch(
+                    f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE_ID}/{record_id}",
+                    headers=_airtable_headers(),
+                    json={"fields": {FLD_STATE: "AWAITING_PRODUCT", FLD_SESSION_JSON: ""}, "typecast": True},
+                )
+            _telegram_send_message(
+                telegram_id,
+                "Ready for another proposal?\n\n"
+                "1. Future First\n2. Life First (Coming Soon)\n3. CI First (Coming Soon)\n\n"
+                "Type 1, 2, or 3 \u2014 or /start to reset completely."
+            )
+        except Exception as e:
+            print(f"[process] auto-reset failed for {record_id}: {e}", flush=True)
     except Exception as e:
         print(f"[process] error for record {record_id}: {e}", flush=True)
         try:

@@ -15,7 +15,7 @@ import os
 import subprocess
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import quote
 
 import httpx
@@ -49,6 +49,32 @@ AGENTS_TABLE_ID = "tbl4pcT77XPif1RpV"
 AGENTS_FLD_TELEGRAM_ID = "Telegram ID"
 AGENTS_FLD_TOTAL_PROPOSALS = "Total Proposals Generated"
 AGENTS_FLD_LAST_ACTIVE = "Last Active"
+
+# Day+1 / Day+3 follow-up reminders -- only scheduled if the agent confirms
+# they're actually sharing the proposal with their prospect.
+REMINDERS_BASE_ID = "appZFDIjzUkvWHFWB"
+REMINDERS_TABLE_ID = "tblxW2HWgbRCB0IsH"
+REM_FLD_TELEGRAM_ID = "Telegram ID"
+REM_FLD_AGENT_NAME = "Agent Name"
+REM_FLD_PROSPECT_NAME = "Prospect Name"
+REM_FLD_PROPOSAL_DATE = "Proposal Date"
+REM_FLD_DAY1_DUE = "Day1 Due"
+REM_FLD_DAY1_SENT = "Day1 Sent"
+REM_FLD_DAY3_DUE = "Day3 Due"
+REM_FLD_DAY3_SENT = "Day3 Sent"
+
+# One row per generated proposal -- admin visibility + weekly summary source.
+PROPOSALS_BASE_ID = "appLcqdXduFZJ9zpI"
+PROPOSALS_TABLE_ID = "tblbUSBVyLhD260nC"
+PROP_FLD_TELEGRAM_ID = "Telegram ID"
+PROP_FLD_AGENT_NAME = "Agent Name"
+PROP_FLD_PROSPECT_NAME = "Prospect Name"
+PROP_FLD_PRODUCT = "Product"
+PROP_FLD_QUOTE_COUNT = "Quote Count"
+PROP_FLD_GENERATED_DATE = "Generated Date"
+
+# Weekly usage summary sent directly to the admin's Telegram.
+ADMIN_TELEGRAM_ID = "7730663679"  # Sutharthan
 
 EXTRACTION_SYSTEM_PROMPT = """You are an extraction engine for AFG's insurance proposal automation. You will be shown
 screenshots from the FWD Malaysia agent quoting app. Extract the data precisely and
@@ -439,6 +465,28 @@ def _track_agent_usage(telegram_id: str):
         print(f"[usage] tracking failed for {telegram_id}: {e}", flush=True)
 
 
+def _log_proposal(telegram_id: str, agent_name: str, prospect_name: str, quote_count: int):
+    """Writes one row to the Proposals log -- admin-browsable in Airtable and
+    the source for the weekly summary. Best-effort, never blocks delivery."""
+    try:
+        with httpx.Client(timeout=15) as client:
+            client.post(
+                f"https://api.airtable.com/v0/{PROPOSALS_BASE_ID}/{PROPOSALS_TABLE_ID}",
+                headers=_airtable_headers(),
+                json={"fields": {
+                    PROP_FLD_TELEGRAM_ID: telegram_id,
+                    PROP_FLD_AGENT_NAME: agent_name,
+                    PROP_FLD_PROSPECT_NAME: prospect_name,
+                    PROP_FLD_PRODUCT: "Future First",
+                    PROP_FLD_QUOTE_COUNT: quote_count,
+                    PROP_FLD_GENERATED_DATE: datetime.utcnow().isoformat(),
+                }, "typecast": True},
+            )
+        print(f"[proposals-log] logged proposal for {prospect_name} by {agent_name}", flush=True)
+    except Exception as e:
+        print(f"[proposals-log] failed to log proposal: {e}", flush=True)
+
+
 def _process_one_record(record: dict):
     fields = record["fields"]
     record_id = record["id"]
@@ -503,26 +551,29 @@ def _process_one_record(record: dict):
             print(f"[process] PPTX delivery failed for {record_id}: {e}", flush=True)
 
         _track_agent_usage(telegram_id)
-        _airtable_update_state(record_id, "DONE")
+        _log_proposal(telegram_id, agent_name, prospect["name"], len(tiers_data))
 
-        # Auto-reset for the next proposal -- agent stays registered (name/code
-        # untouched), only the in-progress proposal data clears, so they can go
-        # straight into another proposal without needing to type /start.
+        # Ask whether this proposal is actually being shared -- only then does
+        # a follow-up reminder make sense. Prospect name is stashed onto the
+        # session so Make can read it back when it handles the yes/no reply.
         try:
             with httpx.Client(timeout=15) as client:
                 client.patch(
                     f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE_ID}/{record_id}",
                     headers=_airtable_headers(),
-                    json={"fields": {FLD_STATE: "AWAITING_PRODUCT", FLD_SESSION_JSON: ""}, "typecast": True},
+                    json={"fields": {
+                        FLD_STATE: "AWAITING_SHARE_CONFIRMATION",
+                        FLD_SESSION_JSON: f"prospect_name:{prospect['name']}",
+                    }, "typecast": True},
                 )
             _telegram_send_message(
                 telegram_id,
-                "Ready for another proposal?\n\n"
-                "1. Future First\n2. Life First (Coming Soon)\n3. CI First (Coming Soon)\n\n"
-                "Type 1, 2, or 3 \u2014 or /start to reset completely."
+                "Will you be sharing this proposal with your prospect?\n\n"
+                "1. Yes\n2. No\n\nType 1 or 2"
             )
         except Exception as e:
-            print(f"[process] auto-reset failed for {record_id}: {e}", flush=True)
+            print(f"[process] share-confirmation prompt failed for {record_id}: {e}", flush=True)
+            _airtable_update_state(record_id, "DONE")
     except Exception as e:
         print(f"[process] error for record {record_id}: {e}", flush=True)
         try:
@@ -530,6 +581,95 @@ def _process_one_record(record: dict):
         except Exception:
             pass
         _airtable_update_state(record_id, "ERROR")
+
+
+def _check_and_send_reminders():
+    """Looks for Day1/Day3 reminders that are due and not yet sent, sends
+    them, and marks them sent. Best-effort -- never allowed to crash the
+    poller loop."""
+    now_iso = datetime.utcnow().isoformat()
+    for due_field, sent_field, label in [
+        (REM_FLD_DAY1_DUE, REM_FLD_DAY1_SENT, "Day+1"),
+        (REM_FLD_DAY3_DUE, REM_FLD_DAY3_SENT, "Day+3"),
+    ]:
+        try:
+            with httpx.Client(timeout=15) as client:
+                r = client.get(
+                    f"https://api.airtable.com/v0/{REMINDERS_BASE_ID}/{REMINDERS_TABLE_ID}",
+                    headers=_airtable_headers(),
+                    params={"filterByFormula": f"AND({{{due_field}}}<='{now_iso}', {{{sent_field}}}=FALSE())"},
+                )
+                r.raise_for_status()
+                records = r.json().get("records", [])
+                for rec in records:
+                    fields = rec["fields"]
+                    telegram_id = fields.get(REM_FLD_TELEGRAM_ID)
+                    prospect_name = fields.get(REM_FLD_PROSPECT_NAME, "your prospect")
+                    if not telegram_id:
+                        continue
+                    text = (
+                        f"\U0001F44B Reminder ({label}): It's been "
+                        f"{'1 day' if label == 'Day+1' else '3 days'} since you shared the "
+                        f"proposal for {prospect_name}.\n\nHave you followed up with them yet?"
+                    )
+                    try:
+                        _telegram_send_message(telegram_id, text)
+                        client.patch(
+                            f"https://api.airtable.com/v0/{REMINDERS_BASE_ID}/{REMINDERS_TABLE_ID}/{rec['id']}",
+                            headers=_airtable_headers(),
+                            json={"fields": {sent_field: True}, "typecast": True},
+                        )
+                        print(f"[reminders] sent {label} to {telegram_id} for {prospect_name}", flush=True)
+                    except Exception as e:
+                        print(f"[reminders] failed to send {label} to {telegram_id}: {e}", flush=True)
+        except Exception as e:
+            print(f"[reminders] check failed for {label}: {e}", flush=True)
+
+
+_last_summary_week = None  # in-memory; resets on redeploy, acceptable for a
+                            # once-a-week admin convenience feature
+
+
+def _send_weekly_summary_if_due():
+    """Sends a usage summary to the admin every Monday, covering the
+    trailing 7 days of the Proposals log. Best-effort, never crashes the
+    poller."""
+    global _last_summary_week
+    now = datetime.utcnow()
+    if now.weekday() != 0:  # 0 = Monday
+        return
+    current_week = now.strftime("%G-W%V")
+    if _last_summary_week == current_week:
+        return
+    try:
+        week_ago = (now - timedelta(days=7)).isoformat()
+        with httpx.Client(timeout=15) as client:
+            r = client.get(
+                f"https://api.airtable.com/v0/{PROPOSALS_BASE_ID}/{PROPOSALS_TABLE_ID}",
+                headers=_airtable_headers(),
+                params={"filterByFormula": f"IS_AFTER({{{PROP_FLD_GENERATED_DATE}}}, '{week_ago}')"},
+            )
+            r.raise_for_status()
+            records = r.json().get("records", [])
+        total_proposals = len(records)
+        counts = {}
+        for rec in records:
+            name = rec["fields"].get(PROP_FLD_AGENT_NAME, "Unknown Agent")
+            counts[name] = counts.get(name, 0) + 1
+
+        lines = [f"\U0001F4CA Weekly Summary\n"]
+        for name, count in sorted(counts.items(), key=lambda x: -x[1]):
+            lines.append(f"{name} \u2014 {count} proposal{'s' if count != 1 else ''}")
+        if not counts:
+            lines.append("No proposals generated this week.")
+        lines.append(f"\nTotal: {total_proposals} proposal{'s' if total_proposals != 1 else ''} from {len(counts)} agent{'s' if len(counts) != 1 else ''}.")
+        text = "\n".join(lines)
+
+        _telegram_send_message(ADMIN_TELEGRAM_ID, text)
+        _last_summary_week = current_week
+        print(f"[weekly-summary] sent for {current_week}: {len(counts)} agents, {total_proposals} proposals", flush=True)
+    except Exception as e:
+        print(f"[weekly-summary] failed: {e}", flush=True)
 
 
 def _poll_loop():
@@ -552,6 +692,12 @@ def _poll_loop():
                     for record in records:
                         print(f"[poller] processing record {record['id']}", flush=True)
                         _process_one_record(record)
+
+                # Reminders are day-scale, so checking every ~5 minutes (75
+                # cycles at 4s each) is plenty and keeps API usage light.
+                if cycle % 75 == 1:
+                    _check_and_send_reminders()
+                    _send_weekly_summary_if_due()
         except Exception as e:
             print(f"[poller] error: {e}", flush=True)
         time.sleep(4)

@@ -123,8 +123,16 @@ RULES:
     alone, and never leave this as "-" if the rider is present -- if truly not
     visible on any provided screenshot, use the plan-tier table to infer it
     from the Room & Board figure: 200->200,000, 300->300,000, 500->500,000,
-    2,000->2,000,000), co_insurance_deductible = its "Deductible" figure (as
-    shown on screen), lifetime_limit = "Unlimited" (this rider has no lifetime
+    2,000->2,000,000), co_insurance_deductible = its actual "Deductible" figure
+    -- IMPORTANT: this amount is typically NOT shown on the same "Additional
+    protection" summary screen as Room & Board and Annual Limit; it appears on
+    a separate deductible-selection screenshot if one was provided among the
+    images for this quote. If a separate deductible screenshot is present,
+    read the figure from THAT image specifically, even if a different
+    deductible-looking number also appears elsewhere. If no separate
+    deductible screenshot was provided and no deductible figure is visible on
+    any image for this quote, output "-" rather than guessing.
+    lifetime_limit = "Unlimited" (this rider has no lifetime
     cap). Also, whenever this rider is present, append this exact sentence to
     remarks (add it after any existing remarks text, don't replace them):
     "Medical Card Rider premium will increase every 5 years."
@@ -258,7 +266,7 @@ def _telegram_download_base64(file_id: str) -> tuple[str, str]:
     return base64.b64encode(img.content).decode("utf-8"), media_type
 
 
-def _call_claude_extraction(images_b64: List[tuple[str, str]]) -> dict:
+def _call_claude_extraction(images_b64: List[tuple[str, str]]) -> tuple[dict, dict]:
     if not ANTHROPIC_API_KEY:
         raise HTTPException(500, "ANTHROPIC_API_KEY not configured on server")
 
@@ -288,6 +296,11 @@ def _call_claude_extraction(images_b64: List[tuple[str, str]]) -> dict:
         r.raise_for_status()
         data = r.json()
 
+    usage = data.get("usage", {})
+    input_tokens = usage.get("input_tokens", 0)
+    output_tokens = usage.get("output_tokens", 0)
+    print(f"[tokens] extraction call: {input_tokens} in, {output_tokens} out, {input_tokens + output_tokens} total", flush=True)
+
     text = "".join(block.get("text", "") for block in data.get("content", []) if block.get("type") == "text")
     text = text.strip()
     if text.startswith("```"):
@@ -297,7 +310,7 @@ def _call_claude_extraction(images_b64: List[tuple[str, str]]) -> dict:
     try:
         parsed = json.loads(text.strip())
         print(f"[extraction] result: {json.dumps(parsed)}", flush=True)
-        return parsed
+        return parsed, usage
     except json.JSONDecodeError as e:
         raise HTTPException(502, f"Claude returned unparseable JSON: {e}. Raw: {text[:500]}")
 
@@ -315,7 +328,7 @@ def generate_from_telegram(req: TelegramGenerateRequest):
         images.append(_telegram_download_base64(rid))
 
     # Extract structured data via Claude
-    extracted = _call_claude_extraction(images)
+    extracted, _usage = _call_claude_extraction(images)
     prospect = extracted["prospect"]
     tier = extracted["tier"]
     tier["tier_label"] = "A"
@@ -362,9 +375,14 @@ def _parse_session_data(raw: str) -> dict:
     """Parses the semicolon-delimited 'key:value;key:value' session string
     the Make bot writes into Session Data JSON. Screenshots are grouped into
     tiers IN THE ORDER THEY WERE UPLOADED: each 'base_photo' starts a new
-    tier, and any 'rider_photo' entries before the next 'base_photo' belong
-    to that tier. This lets an agent upload any number of quotes (1-3) with
-    any number of riders each, with no counting logic needed on the Make side.
+    tier, and any 'rider_photo' or 'deductible_photo' entries before the next
+    'base_photo' belong to that tier. deductible_photo is a separate,
+    optional screenshot -- the FWD Medical Rider's actual deductible amount
+    isn't shown on the same "Additional protection" screen as its other
+    figures, so the agent is asked for it as an extra step only when needed.
+    This lets an agent upload any number of quotes (1-3) with any number of
+    riders (and optional deductible screenshots) each, with no counting
+    logic needed on the Make side.
     """
     result = {"tiers": []}
     current_tier = None
@@ -373,10 +391,12 @@ def _parse_session_data(raw: str) -> dict:
             continue
         key, _, value = segment.partition(":")
         if key == "base_photo":
-            current_tier = {"base_photo": value, "rider_photos": []}
+            current_tier = {"base_photo": value, "rider_photos": [], "deductible_photos": []}
             result["tiers"].append(current_tier)
         elif key == "rider_photo" and current_tier is not None:
             current_tier["rider_photos"].append(value)
+        elif key == "deductible_photo" and current_tier is not None:
+            current_tier["deductible_photos"].append(value)
         else:
             result[key] = value
     return result
@@ -511,19 +531,32 @@ def _process_one_record(record: dict):
         tier_labels = ["A", "B", "C"]
         tiers_data = []
         prospect = None
+        session_input_tokens = 0
+        session_output_tokens = 0
 
         for i, tier_info in enumerate(tiers_raw[:3]):  # template supports up to 3 columns
             base_image = _telegram_download_base64(tier_info["base_photo"])
             images = [profile_image, base_image]
             for rid in tier_info["rider_photos"]:
                 images.append(_telegram_download_base64(rid))
+            for did in tier_info.get("deductible_photos", []):
+                images.append(_telegram_download_base64(did))
 
-            extracted = _call_claude_extraction(images)
+            extracted, usage = _call_claude_extraction(images)
+            session_input_tokens += usage.get("input_tokens", 0)
+            session_output_tokens += usage.get("output_tokens", 0)
             if prospect is None:
                 prospect = extracted["prospect"]
             tier = extracted["tier"]
             tier["tier_label"] = tier_labels[i]
             tiers_data.append(tier)
+
+        session_total_tokens = session_input_tokens + session_output_tokens
+        print(
+            f"[tokens] proposal total for {record_id}: {session_input_tokens} in, "
+            f"{session_output_tokens} out, {session_total_tokens} total across {len(tiers_data)} quote(s)",
+            flush=True,
+        )
 
         base_name = _build_filename(prospect["name"])
         pptx_path = os.path.join(GENERATED_DIR, f"{base_name}.pptx")

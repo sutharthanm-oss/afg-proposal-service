@@ -561,7 +561,14 @@ def _process_one_record(record: dict):
         base_name = _build_filename(prospect["name"])
         pptx_path = os.path.join(GENERATED_DIR, f"{base_name}.pptx")
 
-        data = {"prospect": prospect, "agent_name": agent_name, "tiers": tiers_data}
+        # If the operator generated this proposal on behalf of another agent
+        # (AWAITING_PREPARED_BY_CHOICE / AWAITING_PREPARED_BY_NAME in Make),
+        # that name is what shows on the document and in the Proposals Log --
+        # but usage tracking (below) still counts under the real operator,
+        # since they're the one actually running the bot.
+        prepared_by = parsed.get("prepared_by", agent_name)
+
+        data = {"prospect": prospect, "agent_name": prepared_by, "tiers": tiers_data}
         generate_proposal("future_first", data, pptx_path)
 
         subprocess.run(
@@ -584,7 +591,7 @@ def _process_one_record(record: dict):
             print(f"[process] PPTX delivery failed for {record_id}: {e}", flush=True)
 
         _track_agent_usage(telegram_id)
-        _log_proposal(telegram_id, agent_name, prospect["name"], len(tiers_data))
+        _log_proposal(telegram_id, prepared_by, prospect["name"], len(tiers_data))
 
         # Ask whether this proposal is actually being shared -- only then does
         # a follow-up reminder make sense. Prospect name is stashed onto the
